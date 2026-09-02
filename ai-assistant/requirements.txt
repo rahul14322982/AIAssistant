@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+python-dotenv==1.0.1
+openai==1.51.0
+deepgram-sdk==7.8.0
+elevenlabs==1.10.0
+requests==2.32.3
+twilio==9.3.5
+apscheduler==3.10.4
