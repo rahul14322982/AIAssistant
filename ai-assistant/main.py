@@ -19,12 +19,18 @@ load_dotenv()  # must run BEFORE importing services.* — they read env vars at 
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, Response
-from apscheduler.schedulers.background import BackgroundScheduler
 
 from services.telephony import place_outbound_call, PUBLIC_BASE_URL
 from services.stt import transcribe_audio
 from services.llm import classify_call, generate_outbound_message
 from services.tts import synthesize_speech
+
+from services.scheduler_service import (
+    schedule_call,
+    cancel_call,
+    get_due_calls,
+    mark_call_status,
+)
 
 app = FastAPI(title="AI Assistant - Call Pipeline")
 
@@ -34,8 +40,7 @@ os.makedirs(TMP_DIR, exist_ok=True)
 # India timezone — scheduled times from the user are assumed to be in IST
 IST = ZoneInfo("Asia/Kolkata")
 
-scheduler = BackgroundScheduler(timezone=IST)
-scheduler.start()
+
 
 def generate_and_place_call(instruction: str, phone_number: str) -> dict:
     """
@@ -205,53 +210,59 @@ async def schedule_outbound_call_endpoint(
     scheduled_time: str = Form(...),
 ):
     """
-    Feature 3, scheduled version: same as /make-outbound-call, but the
-    call is placed automatically at a future time instead of right away.
+    Feature 3, scheduled version: saves the call to Firestore instead of
+    firing immediately. An external cron ping to /run-due-calls actually
+    triggers it once the scheduled time arrives.
 
     scheduled_time format: "YYYY-MM-DD HH:MM" in 24-hour IST,
     e.g. "2026-09-05 18:30" for 6:30 PM on 5th September.
-
-    Note: this scheduler runs in-memory — if you stop/restart the
-    uvicorn server, any pending scheduled calls are lost. Fine for
-    testing; a production version would need a persistent job store.
     """
     try:
-        run_time = datetime.strptime(scheduled_time, "%Y-%m-%d %H:%M").replace(tzinfo=IST)
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail="scheduled_time must be in format 'YYYY-MM-DD HH:MM', e.g. '2026-09-05 18:30'",
-        )
-
-    if run_time <= datetime.now(IST):
-        raise HTTPException(status_code=422, detail="scheduled_time must be in the future")
-
-    job_id = str(uuid.uuid4())
-    scheduler.add_job(
-        generate_and_place_call,
-        trigger="date",
-        run_date=run_time,
-        args=[instruction, phone_number],
-        id=job_id,
-    )
+        job_id = schedule_call(instruction, phone_number, scheduled_time)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     return {
         "job_id": job_id,
         "instruction": instruction,
         "phone_number": phone_number,
         "scheduled_time": scheduled_time,
-        "status": f"Call scheduled for {scheduled_time} IST — keep the server running until then",
+        "status": f"Call scheduled for {scheduled_time} IST",
     }
-
-
+  
 @app.delete("/schedule-outbound-call/{job_id}")
 async def cancel_scheduled_call(job_id: str):
     """Cancel a previously scheduled call before it fires."""
-    job = scheduler.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="No scheduled call found with that job_id")
-    scheduler.remove_job(job_id)
+    cancelled = cancel_call(job_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=404,
+            detail="No pending scheduled call found with that job_id",
+        )
     return {"status": "cancelled", "job_id": job_id}
+
+@app.post("/run-due-calls")
+async def run_due_calls():
+    """
+    Checks Firestore for any scheduled calls whose time has arrived and
+    fires them. This endpoint is meant to be pinged periodically by an
+    external free cron service (e.g. cron-job.org) every 1-5 minutes —
+    NOT called manually in normal use.
+    """
+    due = get_due_calls()
+    fired = []
+
+    for call in due:
+        job_id = call["job_id"]
+        try:
+            result = generate_and_place_call(call["instruction"], call["phone_number"])
+            mark_call_status(job_id, "completed", {"call_sid": result["call_sid"]})
+            fired.append({"job_id": job_id, "status": "completed", **result})
+        except Exception as e:
+            mark_call_status(job_id, "failed", {"error": str(e)})
+            fired.append({"job_id": job_id, "status": "failed", "error": str(e)})
+
+    return {"checked_at": "now", "calls_fired": len(fired), "details": fired}
 
 
 @app.api_route("/twiml/{filename}", methods=["GET", "POST"])
