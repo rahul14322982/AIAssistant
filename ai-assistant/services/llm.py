@@ -59,7 +59,7 @@ def classify_call(transcript: str) -> dict:
             {"role": "user", "content": f"Caller said: \"{transcript}\""},
         ],
         temperature=0.3,
-        max_tokens=50
+        max_tokens=40
     )
     content = response.choices[0].message.content.strip()
     try:
@@ -100,6 +100,6 @@ def generate_outbound_message(user_instruction: str) -> str:
             {"role": "user", "content": user_instruction},
         ],
         temperature=0.5,
-        max_tokens=50
+        max_tokens=40
     )
     return response.choices[0].message.content.strip()
